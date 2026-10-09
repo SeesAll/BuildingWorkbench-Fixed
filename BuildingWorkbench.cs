@@ -10,7 +10,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins;
 
-[Info("Building Workbench", "MJSU", "1.4.5")]
+[Info("Building Workbench", "MJSU", "1.4.6")]
 [Description("Extends the range of the workbench to work inside the entire building")]
 public class BuildingWorkbench : RustPlugin
 {
@@ -31,6 +31,7 @@ public class BuildingWorkbench : RustPlugin
     private readonly HashSet<ulong> _notifiedPlayer = new();
     private readonly Dictionary<ulong, PlayerData> _playerData = new();
     private readonly Dictionary<uint, BuildingData> _buildingData = new();
+    private readonly Dictionary<ulong, int> _settledRefreshGeneration = new();
     private float _scanRange;
     private float _halfScanRange;
     private float _requiredDistanceSqr;
@@ -145,11 +146,12 @@ public class BuildingWorkbench : RustPlugin
         GetPlayerData(player.userID);
         player.nextCheckTime = float.MaxValue;
         player.EnterTrigger(_tb);
-        NextTick(() => RefreshPlayer(player));
+        ScheduleSettledRefresh(player);
     }
 
     private void OnPlayerDisconnected(BasePlayer player)
     {
+        _settledRefreshGeneration.Remove(player.userID);
         player.nextCheckTime = 0;
         player.cachedCraftLevel = 0;
         if(_playerData.Remove(player.userID, out PlayerData playerData))
@@ -271,6 +273,45 @@ public class BuildingWorkbench : RustPlugin
         data.LastScanTime = Time.realtimeSinceStartup;
         data.HasScanned = true;
         UpdatePlayerWorkbenchLevel(player);
+    }
+
+    private void ScheduleSettledRefresh(BasePlayer player)
+    {
+        if (!player || !player.IsConnected || !HasPermission(player, UsePermission))
+        {
+            return;
+        }
+
+        ulong playerId = player.userID;
+        int generation = _settledRefreshGeneration.TryGetValue(playerId, out int currentGeneration)
+            ? currentGeneration + 1
+            : 1;
+        _settledRefreshGeneration[playerId] = generation;
+
+        // Do not let a scan performed before teleport settling suppress the normal updater.
+        GetPlayerData(playerId).HasScanned = false;
+
+        ScheduleSettledRefreshAttempt(player, playerId, generation, 0.35f, false);
+        ScheduleSettledRefreshAttempt(player, playerId, generation, 1f, false);
+        ScheduleSettledRefreshAttempt(player, playerId, generation, 2.5f, true);
+    }
+
+    private void ScheduleSettledRefreshAttempt(BasePlayer player, ulong playerId, int generation, float delay, bool finalAttempt)
+    {
+        timer.Once(delay, () =>
+        {
+            if (!_settledRefreshGeneration.TryGetValue(playerId, out int currentGeneration) || currentGeneration != generation)
+            {
+                return;
+            }
+
+            if (finalAttempt)
+            {
+                _settledRefreshGeneration.Remove(playerId);
+            }
+
+            RefreshPlayer(player);
+        });
     }
 
     private void RestoreVanillaWorkbenchHandling(BasePlayer player)
@@ -569,12 +610,26 @@ public class BuildingWorkbench : RustPlugin
     // NTeleportation calls this hook after /home and other player teleports.
     private void OnPlayerTeleported(BasePlayer player, Vector3 oldPosition, Vector3 newPosition)
     {
-        NextTick(() => RefreshPlayer(player));
+        ScheduleSettledRefresh(player);
     }
 
     private void OnPlayerSleepEnded(BasePlayer player)
     {
-        NextTick(() => RefreshPlayer(player));
+        ScheduleSettledRefresh(player);
+    }
+
+    private object CanCraft(ItemCrafter itemCrafter, ItemBlueprint blueprint, int amount)
+    {
+        BasePlayer player = itemCrafter?.owner;
+        if (!player || blueprint == null || blueprint.workbenchLevelRequired <= player.cachedCraftLevel || !HasPermission(player, UsePermission))
+        {
+            return null;
+        }
+
+        // A craft attempt is authoritative evidence that stale workbench state matters now.
+        // Refresh only when the requested blueprint needs a higher tier than the cached tier.
+        RefreshPlayer(player);
+        return null;
     }
     #endregion
 
@@ -749,6 +804,7 @@ public class BuildingWorkbench : RustPlugin
 
     public void GetNearbyAuthorizedBuildingsFast(BasePlayer player, HashSet<uint> authorizedPrivs)
     {
+        AddCurrentAuthorizedBuilding(player, authorizedPrivs);
         HashSet<uint> processedBuildings = Pool.Get<HashSet<uint>>();
         try
         {
@@ -787,6 +843,7 @@ public class BuildingWorkbench : RustPlugin
 
     public void GetNearbyAuthorizedBuildings(BasePlayer player, HashSet<uint> authorizedPrivs)
     {
+        AddCurrentAuthorizedBuilding(player, authorizedPrivs);
         HashSet<uint> processedBuildings = Pool.Get<HashSet<uint>>();
         try
         {
@@ -820,6 +877,15 @@ public class BuildingWorkbench : RustPlugin
         finally
         {
             Pool.FreeUnmanaged(ref processedBuildings);
+        }
+    }
+
+    private static void AddCurrentAuthorizedBuilding(BasePlayer player, HashSet<uint> authorizedBuildings)
+    {
+        BuildingPrivlidge privilege = player.GetBuildingPrivilege();
+        if (privilege && privilege.IsAuthed(player) && privilege.buildingID != 0)
+        {
+            authorizedBuildings.Add(privilege.buildingID);
         }
     }
 

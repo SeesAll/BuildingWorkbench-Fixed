@@ -14,7 +14,8 @@ This build repairs those stale-state paths and adds bounded fallback refreshes w
 
 | Area | Upstream behavior | Fixed build |
 | --- | --- | --- |
-| Teleports and waking | State may remain stale until a later movement scan | Refreshes immediately after compatible teleport and wake hooks |
+| Teleports and waking | State may remain stale until a later movement scan | Coalesces teleport/wake events and refreshes after the destination has settled, with bounded retries |
+| Crafting after movement | A stale cached tier can reject a valid craft | Rechecks on demand only when a blueprint needs a higher tier than the player's cached tier |
 | Stationary players | A missed update may remain cached indefinitely | Performs a configurable low-frequency fallback refresh |
 | Busy servers | Update coroutines can overlap and the live player list can change during iteration | Prevents overlap and scans a stable pooled player snapshot |
 | Workbench/building changes | Cached workbench lists may become stale | Repairs workbench caches periodically and reacts to build/kill hooks |
@@ -23,6 +24,15 @@ This build repairs those stale-state paths and adds bounded fallback refreshes w
 | Configuration | Invalid or non-finite timing/range values can break scanning | Restores safe defaults or clamps unsafe values |
 | Permissions and boats | Some event paths did not consistently honor configuration/permission state | Consistently checks `buildingworkbench.use` and the boat setting |
 | Craft cancellation | Level changes could cancel while state was stale or mutate the queue unsafely | Recalculates first and walks the crafting queue safely |
+
+## Version 1.4.6 reliability update
+
+- Defers teleport refreshes until the player has settled at the destination.
+- Performs three bounded post-teleport/wake checks over 2.5 seconds to tolerate delayed physics and trigger updates.
+- Coalesces overlapping teleport, wake, and connection refresh schedules per player.
+- Refreshes on demand when a craft requires a higher workbench tier than the player's cached tier.
+- Uses the player's active authorized building privilege as an additional building-membership signal.
+- Keeps monument teleports safe by clearing stale building state through the same low-cost, event-driven refresh path.
 
 ## Version 1.4.5 hardening
 

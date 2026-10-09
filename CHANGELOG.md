@@ -2,6 +2,25 @@
 
 All notable changes to this maintenance build are documented here.
 
+## [1.4.6] - 2026-10-09
+
+### Added
+
+- Bounded destination-settling refresh attempts at 0.35, 1.0, and 2.5 seconds after connection, teleport, or waking.
+- An on-demand refresh when a player attempts a craft that requires a higher workbench tier than the currently cached tier.
+- Direct use of the player's active authorized building privilege as an additional building-membership signal.
+
+### Changed
+
+- Teleport and wake hooks now schedule coalesced delayed refreshes instead of scanning on the next server tick.
+- A scheduled destination refresh invalidates the previous movement scan so the normal updater can also recover if needed.
+
+### Fixed
+
+- Home teleports could scan before the player and nearby construction colliders had settled at the destination.
+- Valid building-wide workbench access could remain unavailable until the player walked into a physical workbench trigger.
+- Immediate post-teleport crafting could be rejected while the cached workbench tier was stale.
+
 ## [1.4.5] - 2026-10-08
 
 ### Added
