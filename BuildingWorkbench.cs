@@ -10,7 +10,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins;
 
-[Info("Building Workbench", "MJSU", "1.4.4")]
+[Info("Building Workbench", "MJSU", "1.4.5")]
 [Description("Extends the range of the workbench to work inside the entire building")]
 public class BuildingWorkbench : RustPlugin
 {
@@ -26,12 +26,14 @@ public class BuildingWorkbench : RustPlugin
     private const string UsePermission = "buildingworkbench.use";
     private const string CancelCraftPermission = "buildingworkbench.cancelcraft";
     private const string AccentColor = "#de8732";
+    private const float WorkbenchCacheRefreshSeconds = 60f;
 
-    private readonly List<ulong> _notifiedPlayer = new();
+    private readonly HashSet<ulong> _notifiedPlayer = new();
     private readonly Dictionary<ulong, PlayerData> _playerData = new();
     private readonly Dictionary<uint, BuildingData> _buildingData = new();
     private float _scanRange;
     private float _halfScanRange;
+    private float _requiredDistanceSqr;
     private bool _updateRunning;
 
     private PhysicsScene _physics;
@@ -64,38 +66,50 @@ public class BuildingWorkbench : RustPlugin
     protected override void LoadDefaultConfig()
     {
         PrintWarning("Loading Default Config");
+        _pluginConfig = new PluginConfig();
+        Config.WriteObject(_pluginConfig, true);
     }
 
     protected override void LoadConfig()
     {
         base.LoadConfig();
         Config.Settings.DefaultValueHandling = DefaultValueHandling.Populate;
-        _pluginConfig = Config.ReadObject<PluginConfig>();
-        Config.WriteObject(_pluginConfig);
+        try
+        {
+            _pluginConfig = Config.ReadObject<PluginConfig>() ?? new PluginConfig();
+        }
+        catch (Exception exception)
+        {
+            PrintError($"The configuration file is invalid and has been replaced with defaults: {exception.Message}");
+            LoadDefaultConfig();
+            return;
+        }
+
+        Config.WriteObject(_pluginConfig, true);
     }
 
     private void OnServerInitialized()
     {
         _physics = Physics.defaultPhysicsScene;
-        if (_pluginConfig.BaseDistance < 3f)
+        if (!IsFinite(_pluginConfig.BaseDistance) || _pluginConfig.BaseDistance < 3f)
         {
             PrintWarning("Distance from base to be considered inside building (Meters) cannot be less than 3 meters");
             _pluginConfig.BaseDistance = 3f;
         }
 
-        if (_pluginConfig.UpdateRate < 0.5f)
+        if (!IsFinite(_pluginConfig.UpdateRate) || _pluginConfig.UpdateRate < 0.5f)
         {
             PrintWarning("Inside building check frequency cannot be less than 0.5 seconds");
             _pluginConfig.UpdateRate = 0.5f;
         }
 
-        if (_pluginConfig.RequiredDistance < 0f)
+        if (!IsFinite(_pluginConfig.RequiredDistance) || _pluginConfig.RequiredDistance < 0f)
         {
             PrintWarning("Required distance from last update cannot be negative");
             _pluginConfig.RequiredDistance = 0f;
         }
 
-        if (_pluginConfig.StationaryRefreshRate < _pluginConfig.UpdateRate)
+        if (!IsFinite(_pluginConfig.StationaryRefreshRate) || _pluginConfig.StationaryRefreshRate < _pluginConfig.UpdateRate)
         {
             PrintWarning("Stationary refresh frequency cannot be less than the normal check frequency");
             _pluginConfig.StationaryRefreshRate = _pluginConfig.UpdateRate;
@@ -103,7 +117,8 @@ public class BuildingWorkbench : RustPlugin
 
         _scanRange = _pluginConfig.BaseDistance;
         _halfScanRange = _scanRange / 2f;
-        Config.WriteObject(_pluginConfig);
+        _requiredDistanceSqr = _pluginConfig.RequiredDistance * _pluginConfig.RequiredDistance;
+        Config.WriteObject(_pluginConfig, true);
 
         _go = new GameObject("BuildingWorkbenchObject");
         _wb = _go.AddComponent<WorkbenchBehavior>();
@@ -143,6 +158,7 @@ public class BuildingWorkbench : RustPlugin
             foreach (BuildingData data in buildingData.Values)
             {
                 data.LeaveBuilding(player);
+                RemoveBuildingDataIfUnused(data);
             }
         }
 
@@ -170,7 +186,7 @@ public class BuildingWorkbench : RustPlugin
     #region Workbench Handler
     public void StartUpdatingWorkbench()
     {
-        if (!_updateRunning && BasePlayer.activePlayerList.Count != 0)
+        if (_wb && !_updateRunning && BasePlayer.activePlayerList.Count != 0)
         {
             _updateRunning = true;
             _wb.StartCoroutine(HandleWorkbenchUpdate());
@@ -180,11 +196,15 @@ public class BuildingWorkbench : RustPlugin
     public IEnumerator HandleWorkbenchUpdate()
     {
         float frameWait = 0;
+        List<BasePlayer> players = Pool.Get<List<BasePlayer>>();
         try
         {
-            for (int i = 0; i < BasePlayer.activePlayerList.Count; i++)
+            players.AddRange(BasePlayer.activePlayerList);
+            int playerCount = players.Count;
+            float frameRate = Mathf.Max(Performance.report.frameRate, 30f);
+            for (int i = 0; i < playerCount; i++)
             {
-                BasePlayer player = BasePlayer.activePlayerList[i];
+                BasePlayer player = players[i];
                 if (!player || !player.IsConnected)
                 {
                     continue;
@@ -198,8 +218,7 @@ public class BuildingWorkbench : RustPlugin
 
                 PlayerData data = GetPlayerData(player.userID);
                 Vector3 position = player.transform.position;
-                float requiredDistanceSqr = _pluginConfig.RequiredDistance * _pluginConfig.RequiredDistance;
-                bool movedEnough = !data.HasScanned || (position - data.Position).sqrMagnitude >= requiredDistanceSqr;
+                bool movedEnough = !data.HasScanned || (position - data.Position).sqrMagnitude >= _requiredDistanceSqr;
                 bool refreshExpired = !data.HasScanned || Time.realtimeSinceStartup - data.LastScanTime >= _pluginConfig.StationaryRefreshRate;
                 if (!movedEnough && !refreshExpired)
                 {
@@ -208,7 +227,7 @@ public class BuildingWorkbench : RustPlugin
 
                 RefreshPlayer(player, data, position);
 
-                float waitForFrames = Performance.report.frameRate * _pluginConfig.UpdateRate / BasePlayer.activePlayerList.Count * 0.9f;
+                float waitForFrames = frameRate * _pluginConfig.UpdateRate / playerCount * 0.9f;
                 if (waitForFrames >= 1)
                 {
                     yield return null;
@@ -225,6 +244,7 @@ public class BuildingWorkbench : RustPlugin
         }
         finally
         {
+            Pool.FreeUnmanaged(ref players);
             _updateRunning = false;
         }
     }
@@ -263,6 +283,7 @@ public class BuildingWorkbench : RustPlugin
         foreach (BuildingData building in data.Buildings.Values)
         {
             building.LeaveBuilding(player);
+            RemoveBuildingDataIfUnused(building);
         }
 
         player.LeaveTrigger(_tb);
@@ -278,45 +299,45 @@ public class BuildingWorkbench : RustPlugin
 
     public void UpdatePlayerBuildings(BasePlayer player, PlayerData data)
     {
-        List<uint> currentBuildings = Pool.Get<List<uint>>();
-
-        if (_pluginConfig.FastBuildingCheck)
-        {
-            GetNearbyAuthorizedBuildingsFast(player, currentBuildings);
-        }
-        else
-        {
-            GetNearbyAuthorizedBuildings(player, currentBuildings);
-        }
-
+        HashSet<uint> currentBuildings = Pool.Get<HashSet<uint>>();
         List<uint> leftBuildings = Pool.Get<List<uint>>();
-        foreach (uint buildingId in data.Buildings.Keys)
+        try
         {
-            if (!currentBuildings.Contains(buildingId))
+            if (_pluginConfig.FastBuildingCheck)
             {
-                leftBuildings.Add(buildingId);
+                GetNearbyAuthorizedBuildingsFast(player, currentBuildings);
+            }
+            else
+            {
+                GetNearbyAuthorizedBuildings(player, currentBuildings);
+            }
+
+            foreach (uint buildingId in data.Buildings.Keys)
+            {
+                if (!currentBuildings.Contains(buildingId))
+                {
+                    leftBuildings.Add(buildingId);
+                }
+            }
+
+            for (int index = 0; index < leftBuildings.Count; index++)
+            {
+                OnPlayerLeftBuilding(player, leftBuildings[index]);
+            }
+
+            foreach (uint buildingId in currentBuildings)
+            {
+                if (!data.Buildings.ContainsKey(buildingId))
+                {
+                    OnPlayerEnterBuilding(player, buildingId);
+                }
             }
         }
-
-        for (int index = 0; index < leftBuildings.Count; index++)
+        finally
         {
-            uint leftBuilding = leftBuildings[index];
-            OnPlayerLeftBuilding(player, leftBuilding);
+            Pool.FreeUnmanaged(ref currentBuildings);
+            Pool.FreeUnmanaged(ref leftBuildings);
         }
-
-        for (int index = 0; index < currentBuildings.Count; index++)
-        {
-            uint currentBuilding = currentBuildings[index];
-            if (!data.Buildings.ContainsKey(currentBuilding))
-            {
-                OnPlayerEnterBuilding(player, currentBuilding);
-            }
-        }
-
-        //Puts($"{nameof(BuildingData)}.{nameof(UpdatePlayerPriv)} {player.displayName} In: {string.Join(",", currentBuildings.Select(b => b.ToString().ToArray()))} Left: {string.Join(",", leftBuildings.Select(b => b.ToString().ToArray()))}");
-
-        Pool.FreeUnmanaged(ref currentBuildings);
-        Pool.FreeUnmanaged(ref leftBuildings);
     }
 
     public void OnPlayerEnterBuilding(BasePlayer player, uint buildingId)
@@ -341,7 +362,7 @@ public class BuildingWorkbench : RustPlugin
         }
 
         building.LeaveBuilding(player);
-
+        RemoveBuildingDataIfUnused(building);
     }
     #endregion
 
@@ -356,9 +377,11 @@ public class BuildingWorkbench : RustPlugin
                 return;
             }
 
-            BuildingData data = GetBuildingData(bench.buildingID);
-            data.OnBenchBuilt(bench);
-            UpdateBuildingPlayers(data);
+            if (_buildingData.TryGetValue(bench.buildingID, out BuildingData data))
+            {
+                data.OnBenchBuilt(bench);
+                UpdateBuildingPlayers(data);
+            }
 
             if (!_pluginConfig.BuiltNotification)
             {
@@ -376,12 +399,10 @@ public class BuildingWorkbench : RustPlugin
                 return;
             }
 
-            if (_notifiedPlayer.Contains(player.userID.Get()))
+            if (!_notifiedPlayer.Add(player.userID))
             {
                 return;
             }
-
-            _notifiedPlayer.Add(player.userID);
 
             if (GameTipAPI == null)
             {
@@ -403,6 +424,7 @@ public class BuildingWorkbench : RustPlugin
 
         data.OnBenchKilled(bench);
         UpdateBuildingPlayers(data);
+        RemoveBuildingDataIfUnused(data);
     }
 
     private void OnEntityKill(BuildingPrivlidge tc)
@@ -474,7 +496,11 @@ public class BuildingWorkbench : RustPlugin
 
     private void OnCupboardClearList(BuildingPrivlidge privilege)
     {
-        BuildingData data = GetBuildingData(privilege.buildingID);
+        if (!_buildingData.TryGetValue(privilege.buildingID, out BuildingData data))
+        {
+            return;
+        }
+
         for (int index = data.Players.Count - 1; index >= 0; index--)
         {
             BasePlayer player = data.Players[index];
@@ -489,8 +515,8 @@ public class BuildingWorkbench : RustPlugin
         {
             return;
         }
-        BuildingData data = GetBuildingData(boat);
-        if (data == null)
+        if (!TryGetPlayerBoatBuildingId(boat, out uint buildingId) ||
+            !_buildingData.TryGetValue(buildingId, out BuildingData data))
         {
             return;
         }
@@ -566,6 +592,8 @@ public class BuildingWorkbench : RustPlugin
 
             UpdatePlayerWorkbenchLevel(player);
         }
+
+        RemoveBuildingDataIfUnused(building);
     }
 
     public void UpdatePlayerWorkbenchLevel(BasePlayer player)
@@ -702,85 +730,97 @@ public class BuildingWorkbench : RustPlugin
         return TryGetPlayerBoatBuildingId(boat, out uint buildingId) ? GetBuildingData(buildingId) : null;
     }
 
-    private readonly RaycastHit[] _hits = new RaycastHit[256];
-    private readonly HashSet<uint> _processedBuildings = new();
-
-    public void GetNearbyAuthorizedBuildingsFast(BasePlayer player, List<uint> authorizedPrivs)
+    private void RemoveBuildingDataIfUnused(BuildingData building)
     {
-        OBB obb = player.WorldSpaceBounds();
-        float baseDistance = _scanRange;
-        int amount = _physics.Raycast(player.transform.position + Vector3.down * _halfScanRange, Vector3.up, _hits, baseDistance, Rust.Layers.Construction, QueryTriggerInteraction.Ignore);
-        for (int index = 0; index < amount; index++)
+        if (building == null || building.Players.Count != 0)
         {
-            BuildingBlock block = _hits[index].transform.ToBaseEntity() as BuildingBlock;
-            if (!block)
-            {
-                continue;
-            }
-
-            if (_processedBuildings.Contains(block.buildingID) || obb.Distance(block.WorldSpaceBounds()) > baseDistance)
-            {
-                continue;
-            }
-
-            _processedBuildings.Add(block.buildingID);
-            if (block is BoatBuildingBlock boatBlock)
-            {
-                if (_pluginConfig.EnableBoatCheck && TryGetPlayerBoat(boatBlock, out PlayerBoat boat) && boat.IsAuthedForBuilding(player))
-                {
-                    authorizedPrivs.Add(boatBlock.buildingID);
-                }
-            }
-            else
-            {
-                BuildingPrivlidge priv = block.GetBuilding()?.GetDominatingBuildingPrivilege();
-                if (priv && priv.IsAuthed(player))
-                {
-                    authorizedPrivs.Add(priv.buildingID);
-                }
-            }
+            return;
         }
-        _processedBuildings.Clear();
+
+        if (_buildingData.TryGetValue(building.BuildingId, out BuildingData cached) && ReferenceEquals(cached, building))
+        {
+            _buildingData.Remove(building.BuildingId);
+        }
     }
 
-    public void GetNearbyAuthorizedBuildings(BasePlayer player, List<uint> authorizedPrivs)
+    private static bool IsFinite(float value) => !float.IsNaN(value) && !float.IsInfinity(value);
+
+    private readonly RaycastHit[] _hits = new RaycastHit[256];
+
+    public void GetNearbyAuthorizedBuildingsFast(BasePlayer player, HashSet<uint> authorizedPrivs)
     {
-        OBB obb = player.WorldSpaceBounds();
-        float baseDistance = _pluginConfig.BaseDistance;
-        int amount = _physics.OverlapSphere(obb.position, baseDistance + obb.extents.magnitude, Vis.colBuffer, Rust.Layers.Construction | Rust.Layers.VehiclesLarge, QueryTriggerInteraction.Ignore);
-        for (int index = 0; index < amount; index++)
+        HashSet<uint> processedBuildings = Pool.Get<HashSet<uint>>();
+        try
         {
-            Collider collider = Vis.colBuffer[index];
-            BuildingBlock block = collider.ToBaseEntity() as BuildingBlock;
-            if (!block)
+            OBB obb = player.WorldSpaceBounds();
+            int amount = _physics.Raycast(player.transform.position + Vector3.down * _halfScanRange, Vector3.up, _hits, _scanRange, Rust.Layers.Construction, QueryTriggerInteraction.Ignore);
+            for (int index = 0; index < amount; index++)
             {
-                continue;
-            }
-
-            if (_processedBuildings.Contains(block.buildingID) || obb.Distance(block.WorldSpaceBounds()) > baseDistance)
-            {
-                continue;
-            }
-
-            _processedBuildings.Add(block.buildingID);
-            if (block is BoatBuildingBlock boatBlock)
-            {
-                if(_pluginConfig.EnableBoatCheck && TryGetPlayerBoat(boatBlock, out PlayerBoat boat) && boat.IsAuthedForBuilding(player))
+                BuildingBlock block = _hits[index].transform.ToBaseEntity() as BuildingBlock;
+                if (!block || !processedBuildings.Add(block.buildingID) || obb.Distance(block.WorldSpaceBounds()) > _scanRange)
                 {
-                    authorizedPrivs.Add(boatBlock.buildingID);
+                    continue;
                 }
-            }
-            else
-            {
-                BuildingPrivlidge priv = block.GetBuilding()?.GetDominatingBuildingPrivilege();
-                if (priv && priv.IsAuthed(player))
+
+                if (block is BoatBuildingBlock boatBlock)
                 {
-                    authorizedPrivs.Add(priv.buildingID);
+                    if (_pluginConfig.EnableBoatCheck && TryGetPlayerBoat(boatBlock, out PlayerBoat boat) && boat.IsAuthedForBuilding(player))
+                    {
+                        authorizedPrivs.Add(boatBlock.buildingID);
+                    }
+                }
+                else
+                {
+                    BuildingPrivlidge priv = block.GetBuilding()?.GetDominatingBuildingPrivilege();
+                    if (priv && priv.IsAuthed(player))
+                    {
+                        authorizedPrivs.Add(priv.buildingID);
+                    }
                 }
             }
         }
+        finally
+        {
+            Pool.FreeUnmanaged(ref processedBuildings);
+        }
+    }
 
-        _processedBuildings.Clear();
+    public void GetNearbyAuthorizedBuildings(BasePlayer player, HashSet<uint> authorizedPrivs)
+    {
+        HashSet<uint> processedBuildings = Pool.Get<HashSet<uint>>();
+        try
+        {
+            OBB obb = player.WorldSpaceBounds();
+            int amount = _physics.OverlapSphere(obb.position, _scanRange + obb.extents.magnitude, Vis.colBuffer, Rust.Layers.Construction | Rust.Layers.VehiclesLarge, QueryTriggerInteraction.Ignore);
+            for (int index = 0; index < amount; index++)
+            {
+                BuildingBlock block = Vis.colBuffer[index].ToBaseEntity() as BuildingBlock;
+                if (!block || !processedBuildings.Add(block.buildingID) || obb.Distance(block.WorldSpaceBounds()) > _scanRange)
+                {
+                    continue;
+                }
+
+                if (block is BoatBuildingBlock boatBlock)
+                {
+                    if (_pluginConfig.EnableBoatCheck && TryGetPlayerBoat(boatBlock, out PlayerBoat boat) && boat.IsAuthedForBuilding(player))
+                    {
+                        authorizedPrivs.Add(boatBlock.buildingID);
+                    }
+                }
+                else
+                {
+                    BuildingPrivlidge priv = block.GetBuilding()?.GetDominatingBuildingPrivilege();
+                    if (priv && priv.IsAuthed(player))
+                    {
+                        authorizedPrivs.Add(priv.buildingID);
+                    }
+                }
+            }
+        }
+        finally
+        {
+            Pool.FreeUnmanaged(ref processedBuildings);
+        }
     }
 
     public void Chat(BasePlayer player, string message) => PrintToChat(player, Lang(LangKeys.Chat, player, message));
@@ -820,6 +860,7 @@ public class BuildingWorkbench : RustPlugin
             BuildingId = buildingId;
             Workbenches = BuildingManager.server.GetBuilding(buildingId)?.decayEntities.OfType<Workbench>().ToList() ?? new List<Workbench>();
             UpdateBestBench();
+            _nextWorkbenchRefresh = Time.realtimeSinceStartup + WorkbenchCacheRefreshSeconds;
         }
 
         public void EnterBuilding(BasePlayer player)
@@ -880,7 +921,7 @@ public class BuildingWorkbench : RustPlugin
 
         private void RefreshWorkbenches()
         {
-            _nextWorkbenchRefresh = Time.realtimeSinceStartup + 60f;
+            _nextWorkbenchRefresh = Time.realtimeSinceStartup + WorkbenchCacheRefreshSeconds;
             var building = BuildingManager.server.GetBuilding(BuildingId);
             Workbenches.Clear();
             if (building != null)
@@ -923,15 +964,15 @@ public class BuildingWorkbench : RustPlugin
     {
         [DefaultValue(true)]
         [JsonProperty(PropertyName = "Display workbench built notification")]
-        public bool BuiltNotification { get; set; }
+        public bool BuiltNotification { get; set; } = true;
 
         [DefaultValue(true)]
         [JsonProperty(PropertyName = "Display cancel craft notification")]
-        public bool CancelCraftNotification { get; set; }
+        public bool CancelCraftNotification { get; set; } = true;
 
         [DefaultValue(3f)]
         [JsonProperty(PropertyName = "Inside building check frequency (Seconds)")]
-        public float UpdateRate { get; set; }
+        public float UpdateRate { get; set; } = 3f;
 
         [DefaultValue(false)]
         [JsonProperty(PropertyName = "Enable Fast Building Check (Only checks above and below a player)")]
@@ -943,15 +984,15 @@ public class BuildingWorkbench : RustPlugin
 
         [DefaultValue(16f)]
         [JsonProperty(PropertyName = "Distance from base to be considered inside building (Meters)")]
-        public float BaseDistance { get; set; }
+        public float BaseDistance { get; set; } = 16f;
 
-        [DefaultValue(5)]
+        [DefaultValue(5f)]
         [JsonProperty(PropertyName = "Required distance from last update (Meters)")]
-        public float RequiredDistance { get; set; }
+        public float RequiredDistance { get; set; } = 5f;
 
         [DefaultValue(10f)]
         [JsonProperty(PropertyName = "Maximum time between checks while stationary (Seconds)")]
-        public float StationaryRefreshRate { get; set; }
+        public float StationaryRefreshRate { get; set; } = 10f;
     }
 
     public class PlayerData
